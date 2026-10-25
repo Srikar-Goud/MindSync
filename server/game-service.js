@@ -24,13 +24,14 @@ export class GameService {
     this.phaseTimers = new Map();
     this.rateLimits = new Map();
     this.chatLimits = new Map();
+    this.pendingRoomActions = new Set();
   }
 
   attach(socket) {
     const events = {
-      'room:create': (payload) => this.createRoom(socket, payload),
-      'room:join': (payload) => this.joinRoom(socket, payload),
-      'room:resume': (payload) => this.resumeRoom(socket, payload),
+      'room:create': (payload) => this.withUnboundSocket(socket, () => this.createRoom(socket, payload)),
+      'room:join': (payload) => this.withUnboundSocket(socket, () => this.joinRoom(socket, payload)),
+      'room:resume': (payload) => this.withUnboundSocket(socket, () => this.resumeRoom(socket, payload)),
       'room:leave': () => this.leaveRoom(socket),
       'player:profile': (payload) => this.setProfile(socket, payload),
       'chat:send': (payload) => this.sendChat(socket, payload),
@@ -52,6 +53,18 @@ export class GameService {
     }
     socket.on('transport:heartbeat', () => {});
     socket.on('disconnect', () => { this.handleDisconnect(socket.id).catch(() => {}); });
+  }
+
+  async withUnboundSocket(socket, action) {
+    if (this.socketPlayers.has(socket.id) || this.pendingRoomActions.has(socket.id)) {
+      throw new Error('Leave your current party before joining another.');
+    }
+    this.pendingRoomActions.add(socket.id);
+    try {
+      return await action();
+    } finally {
+      this.pendingRoomActions.delete(socket.id);
+    }
   }
 
   async restoreRooms() {
@@ -200,10 +213,21 @@ export class GameService {
     this.playerSockets.delete(key);
     this.socketPlayers.delete(socket.id);
     if (removeAll) {
-      await this.store.delete(code);
-      const activeTimer = this.phaseTimers.get(code);
-      if (activeTimer) clearTimeout(activeTimer.timer);
-      this.phaseTimers.delete(code);
+      const deleted = await this.store.delete(code, room.revision);
+      if (deleted) {
+        const activeTimer = this.phaseTimers.get(code);
+        if (activeTimer) clearTimeout(activeTimer.timer);
+        this.phaseTimers.delete(code);
+        for (const key of this.chatLimits.keys()) {
+          if (key.startsWith(`${code}:`)) this.chatLimits.delete(key);
+        }
+      } else {
+        const current = await this.store.get(code);
+        if (current) {
+          this.schedule(current);
+          this.broadcast(current);
+        }
+      }
     } else this.broadcast(room);
     socket.leave(code);
     return { left: true, resetMatch };

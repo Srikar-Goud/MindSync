@@ -8,6 +8,7 @@ const INTRO_KEY = 'mindsync-intro-seen-v2';
 const AVATAR_KEY = 'mindsync-avatar-v1';
 const SOUND_KEY = 'mindsync-sound-v1';
 const MOTION_KEY = 'mindsync-motion-v1';
+const ACK_TIMEOUT_MS = 10_000;
 const AVATARS = ['🛰️', '🦊', '🐺', '🐼', '🦉', '🐙', '🦋', '🐸', '🐯', '🦄', '👾', '🤖', '🎭', '🧿', '🔥', '🌙'];
 const MISSION_STAGES = [
   { name: 'Relay Dock', location: 'LOW ORBIT · COMMS ARRAY', icon: '◌', tint: 'violet', detail: 'A silent signal was intercepted above the cloud line.' },
@@ -49,6 +50,72 @@ function playCue(kind, enabled) {
 function readSavedSession() {
   try { return JSON.parse(localStorage.getItem(SESSION_KEY) || 'null'); }
   catch { return null; }
+}
+
+function clearSavedSession() {
+  try { localStorage.removeItem(SESSION_KEY); } catch { /* Storage is optional. */ }
+}
+
+function emitWithAck(socket, event, payload) {
+  return new Promise((resolve) => {
+    if (!socket.connected) {
+      resolve({ ok: false, error: 'Connection is still restoring. Try again in a moment.' });
+      return;
+    }
+    socket.timeout(ACK_TIMEOUT_MS).emit(event, payload, (timeoutError, result) => {
+      if (timeoutError) {
+        resolve({ ok: false, timedOut: true, error: 'The server did not respond in time. Check your connection and retry.' });
+        return;
+      }
+      resolve(result ?? { ok: false, error: 'The server returned an empty response.' });
+    });
+  });
+}
+
+function useDialogFocus(onClose) {
+  const containerRef = useRef(null);
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
+
+  useEffect(() => {
+    const container = containerRef.current;
+    const previousFocus = document.activeElement;
+    const getFocusable = () => [...(container?.querySelectorAll(
+      'button:not([disabled]), input:not([disabled]), textarea:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])',
+    ) ?? [])].filter((element) => element.getAttribute('aria-hidden') !== 'true');
+    getFocusable()[0]?.focus();
+
+    const onKeyDown = (event) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        onCloseRef.current();
+        return;
+      }
+      if (event.key !== 'Tab') return;
+      const focusable = getFocusable();
+      if (!focusable.length) {
+        event.preventDefault();
+        container?.focus();
+        return;
+      }
+      const first = focusable[0];
+      const last = focusable.at(-1);
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    document.addEventListener('keydown', onKeyDown);
+    return () => {
+      document.removeEventListener('keydown', onKeyDown);
+      if (previousFocus instanceof HTMLElement && previousFocus.isConnected) previousFocus.focus();
+    };
+  }, []);
+
+  return containerRef;
 }
 
 function App() {
@@ -99,9 +166,13 @@ function App() {
       setOnline(true);
       const saved = readSavedSession();
       if (saved?.code && saved?.token) {
-        socket.emit('room:resume', saved, (result) => {
+        emitWithAck(socket, 'room:resume', saved).then((result) => {
+          if (result?.timedOut) {
+            setError(result.error);
+            return;
+          }
           if (!result?.ok) {
-            localStorage.removeItem(SESSION_KEY);
+            clearSavedSession();
             setSession(null);
             setState(null);
             setError(result?.error || 'Could not restore the saved room. Join again with its code.');
@@ -160,17 +231,17 @@ function App() {
     if (state?.phase === 'proposal') setTeam([]);
   }, [state?.phase, state?.mission?.number, state?.leaderId]);
 
-  const send = (event, payload = {}) => new Promise((resolve) => {
-    if (!socket.connected) { resolve({ ok: false, error: 'Connection is still restoring. Try again in a moment.' }); return; }
-    socket.emit(event, payload, resolve);
-  });
+  const send = (event, payload = {}) => emitWithAck(socket, event, payload);
 
   const saveSession = (result) => {
     const saved = { code: result.code, token: result.token, playerId: result.playerId };
-    localStorage.setItem(SESSION_KEY, JSON.stringify(saved));
+    let persisted = true;
+    try { localStorage.setItem(SESSION_KEY, JSON.stringify(saved)); }
+    catch { persisted = false; }
     setSession(saved);
     setCode(result.code);
     setError('');
+    if (!persisted) setNotice('Your seat is active, but this browser cannot save its player key. Keep this tab open.');
   };
 
   const run = async (event, payload = {}, options = {}) => {
@@ -224,7 +295,7 @@ function App() {
   };
 
   const leaveDevice = () => {
-    localStorage.removeItem(SESSION_KEY);
+    clearSavedSession();
     setSession(null);
     setState(null);
     setCode('');
@@ -336,7 +407,8 @@ function ChatDock({ state, send }) {
 }
 
 function CinematicIntro({ onFinish }) {
-  return <div className="cinematic-intro" role="dialog" aria-label="MindSync introduction"><div className="intro-noise" /><div className="intro-console"><span><i /> UPLINK ESTABLISHED</span><span>PROTOCOL 01.05</span></div><div className="intro-art-wrap"><OperatorArt /></div><div className="intro-copy"><span className="eyebrow">A SOCIAL DEDUCTION OPERATION</span><h1>Trust is a <em>weapon.</em></h1><p>Five stages. One hidden saboteur. Every vote leaves a trace.</p></div><div className="intro-bottom"><div className="intro-progress"><i /></div><span>BRIEFING LOADING · 05 SECONDS</span><button onClick={onFinish}>SKIP INTRO ↗</button></div></div>;
+  const dialogRef = useDialogFocus(onFinish);
+  return <div ref={dialogRef} className="cinematic-intro" role="dialog" aria-modal="true" aria-label="MindSync introduction"><div className="intro-noise" /><div className="intro-console"><span><i /> UPLINK ESTABLISHED</span><span>PROTOCOL 01.05</span></div><div className="intro-art-wrap"><OperatorArt /></div><div className="intro-copy"><span className="eyebrow">A SOCIAL DEDUCTION OPERATION</span><h1>Trust is a <em>weapon.</em></h1><p>Five stages. One hidden saboteur. Every vote leaves a trace.</p></div><div className="intro-bottom"><div className="intro-progress"><i /></div><span>BRIEFING LOADING · 05 SECONDS</span><button onClick={onFinish}>SKIP INTRO ↗</button></div></div>;
 }
 
 function OperatorArt() {
@@ -363,17 +435,19 @@ const TUTORIAL_STEPS = [
 function TutorialModal({ onClose }) {
   const [step, setStep] = useState(0);
   const [playing, setPlaying] = useState(true);
+  const dialogRef = useDialogFocus(onClose);
   useEffect(() => {
     if (!playing) return undefined;
     const timer = window.setInterval(() => setStep((current) => (current + 1) % TUTORIAL_STEPS.length), 3200);
     return () => window.clearInterval(timer);
   }, [playing]);
   const slide = TUTORIAL_STEPS[step];
-  return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><section className="tutorial-modal" role="dialog" aria-modal="true" aria-labelledby="tutorial-title"><header className="modal-header"><div><span className="eyebrow">20-SECOND GAMEPLAY BRIEFING</span><h2 id="tutorial-title">How to play</h2></div><button className="modal-close" onClick={onClose} aria-label="Close tutorial">×</button></header><div className={`tutorial-stage tutorial-${slide.accent}`}><div className="tutorial-art"><OperatorArt /><div className="tutorial-overlay-chip">{slide.label}</div><div className="tutorial-ui-card card-a"><span className="tutorial-mini-avatar">🛰️</span><i /><b>{step === 0 ? 'ROOM READY' : step === 1 ? 'PROPOSAL SENT' : step === 2 ? 'SIGNAL FOUND' : step === 3 ? 'ACTION SEALED' : 'MISSION CLEAR'}</b></div><div className="tutorial-ui-card card-b"><span>{['03 / 08', '02 / 03', '⌁ ECHO', '◈ PRIVATE', '03 POINTS'][step]}</span><i /></div><span className="tutorial-target target-one" /><span className="tutorial-target target-two" /></div><div className="tutorial-caption"><span>{slide.label}</span><h3>{slide.title}</h3><p>{slide.text}</p></div></div><div className="tutorial-controls"><div className="tutorial-dots">{TUTORIAL_STEPS.map((item, index) => <button key={item.label} onClick={() => setStep(index)} className={index === step ? 'active' : ''} aria-label={`Show ${item.title}`} />)}</div><button className="tutorial-play" onClick={() => setPlaying(!playing)}>{playing ? 'Ⅱ Pause' : '▶ Play'}</button><button className="tutorial-next" onClick={() => setStep((step + 1) % TUTORIAL_STEPS.length)}>Next scene ↗</button></div></section></div>;
+  return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><section ref={dialogRef} className="tutorial-modal" role="dialog" aria-modal="true" aria-labelledby="tutorial-title"><header className="modal-header"><div><span className="eyebrow">20-SECOND GAMEPLAY BRIEFING</span><h2 id="tutorial-title">How to play</h2></div><button className="modal-close" onClick={onClose} aria-label="Close tutorial">×</button></header><div className={`tutorial-stage tutorial-${slide.accent}`}><div className="tutorial-art"><OperatorArt /><div className="tutorial-overlay-chip">{slide.label}</div><div className="tutorial-ui-card card-a"><span className="tutorial-mini-avatar">🛰️</span><i /><b>{step === 0 ? 'ROOM READY' : step === 1 ? 'PROPOSAL SENT' : step === 2 ? 'SIGNAL FOUND' : step === 3 ? 'ACTION SEALED' : 'MISSION CLEAR'}</b></div><div className="tutorial-ui-card card-b"><span>{['03 / 08', '02 / 03', '⌁ ECHO', '◈ PRIVATE', '03 POINTS'][step]}</span><i /></div><span className="tutorial-target target-one" /><span className="tutorial-target target-two" /></div><div className="tutorial-caption"><span>{slide.label}</span><h3>{slide.title}</h3><p>{slide.text}</p></div></div><div className="tutorial-controls"><div className="tutorial-dots">{TUTORIAL_STEPS.map((item, index) => <button key={item.label} onClick={() => setStep(index)} className={index === step ? 'active' : ''} aria-label={`Show ${item.title}`} />)}</div><button className="tutorial-play" onClick={() => setPlaying(!playing)}>{playing ? 'Ⅱ Pause' : '▶ Play'}</button><button className="tutorial-next" onClick={() => setStep((step + 1) % TUTORIAL_STEPS.length)}>Next scene ↗</button></div></section></div>;
 }
 
 function SettingsModal({ soundOn, setSoundOn, reducedMotion, setReducedMotion, onReplayIntro, onClose }) {
-  return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><section className="settings-modal" role="dialog" aria-modal="true" aria-labelledby="settings-title"><header className="modal-header"><div><span className="eyebrow">PERSONALIZE YOUR OPERATION</span><h2 id="settings-title">Options</h2></div><button className="modal-close" onClick={onClose} aria-label="Close options">×</button></header><button className="setting-row" onClick={() => setSoundOn(!soundOn)}><span><strong>Game sound effects</strong><small>Soft mission pings and outcome cues</small></span><i className={`toggle-switch ${soundOn ? 'on' : ''}`} /></button><button className="setting-row" onClick={() => setReducedMotion(!reducedMotion)}><span><strong>Reduce motion</strong><small>Turn off moving scenes and transitions</small></span><i className={`toggle-switch ${reducedMotion ? 'on' : ''}`} /></button><button className="secondary-button replay-intro" onClick={onReplayIntro}>Replay cinematic intro ↻</button><p className="settings-note">Sound starts after your first interaction. You can change these settings any time.</p></section></div>;
+  const dialogRef = useDialogFocus(onClose);
+  return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><section ref={dialogRef} className="settings-modal" role="dialog" aria-modal="true" aria-labelledby="settings-title"><header className="modal-header"><div><span className="eyebrow">PERSONALIZE YOUR OPERATION</span><h2 id="settings-title">Options</h2></div><button className="modal-close" onClick={onClose} aria-label="Close options">×</button></header><button className="setting-row" onClick={() => setSoundOn(!soundOn)}><span><strong>Game sound effects</strong><small>Soft mission pings and outcome cues</small></span><i className={`toggle-switch ${soundOn ? 'on' : ''}`} /></button><button className="setting-row" onClick={() => setReducedMotion(!reducedMotion)}><span><strong>Reduce motion</strong><small>Turn off moving scenes and transitions</small></span><i className={`toggle-switch ${reducedMotion ? 'on' : ''}`} /></button><button className="secondary-button replay-intro" onClick={onReplayIntro}>Replay cinematic intro ↻</button><p className="settings-note">Sound starts after your first interaction. You can change these settings any time.</p></section></div>;
 }
 
 function ConnectionPip({ online }) {

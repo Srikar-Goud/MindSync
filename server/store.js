@@ -11,7 +11,11 @@ export class MemoryRoomStore {
     return true;
   }
   async get(code) { const room = this.rooms.get(code); return room ? clone(room) : null; }
-  async delete(code) { return this.rooms.delete(code); }
+  async delete(code, expectedRevision) {
+    const room = this.rooms.get(code);
+    if (!room || (expectedRevision != null && (room.revision !== expectedRevision || room.players.length !== 0))) return false;
+    return this.rooms.delete(code);
+  }
   async compareAndSet(code, expectedRevision, next) {
     const current = this.rooms.get(code);
     if (!current || current.revision !== expectedRevision) return false;
@@ -47,7 +51,15 @@ export class MongoRoomStore {
     const { _id, ...rest } = room;
     return rest;
   }
-  async delete(code) { await this.collection.deleteOne({ _id: code }); }
+  async delete(code, expectedRevision) {
+    const filter = { _id: code };
+    if (expectedRevision != null) {
+      filter.revision = expectedRevision;
+      filter.players = { $size: 0 };
+    }
+    const result = await this.collection.deleteOne(filter);
+    return result.deletedCount === 1;
+  }
   async compareAndSet(code, expectedRevision, next) {
     const { code: _code, revision: _revision, ...fields } = next;
     const result = await this.collection.updateOne(

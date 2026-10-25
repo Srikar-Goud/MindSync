@@ -50,12 +50,14 @@ npm run build
 
 ## Deploy to Render
 
-The included `render.yaml` configures a single Node web service that serves both the app and Socket.IO. Render supports WebSocket connections on web services. The free service can sleep after inactivity and may restart; rooms are kept in MongoDB so players can reconnect after a restart. Clients send a small heartbeat while connected so an active room keeps delivering WebSocket traffic.
+The live game is available at <https://mindsync-knm6.onrender.com/>. The Render web service runs in Singapore and serves the Vite build, Express API, and Socket.IO from the repository root. The included `render.yaml` keeps the service configuration in source control.
 
-1. Create a MongoDB Atlas Free cluster and a database user. Add the database connection string as the Render service environment variable `MONGODB_URI`; set `MONGODB_DATABASE` to `mindsync` if desired.
-2. In the Render service dashboard, open **Connect → Outbound** and copy that service's region-specific IP ranges. Add those ranges to the Atlas project's IP access list. Render shares these ranges with other services in the same region, so use a dedicated database user with access only to this app's database. Keep the connection string in Render's secret settings; the browser never receives it.
-3. Create a remote GitHub repository for this local repository, push the project, and connect it to Render. Choose the repository root as the service root; Render runs `npm ci && npm run build`, then `npm start`.
-4. Open the deployed URL on two separate devices, create a room, and play through a match. A successful build alone does not confirm that a public deployment works.
+To create another deployment from this repository:
 
-Atlas Free clusters have limited storage and throughput. This configuration is for challenge-scale rooms and match summaries; it is not a claim of production-scale capacity. No public deployment has been made from this workspace.
+1. Connect `https://github.com/Srikar-Goud/MindSync` to Render and apply the repository's Blueprint (`render.yaml`). Keep the service root at the repository root.
+2. Add `MONGODB_URI` as a secret environment variable and set `MONGODB_DATABASE=mindsync`. Never put the connection string in Git or the browser bundle.
+3. In the Render service dashboard, open **Connect → Outbound** and add that service's region-specific IP ranges to the Atlas project's IP access list. Render shares these ranges with other services in the same region; use a database user restricted to this app's database.
+4. The Blueprint builds with `npm ci --include=dev && npm run build`, starts with `npm start`, and checks `/health`. Verify the public URL and connect from two separate devices before hosting a match.
+
+The Render Free web service can spin down after inactivity and take about a minute to wake. It is intended for demonstrations and hobby use, not always-on production traffic. The current game server keeps socket membership and phase timers in process memory, so run one instance; horizontal scaling requires a shared Socket.IO adapter and coordinated timer ownership. Atlas Free clusters also have limited storage and throughput, so this configuration is for challenge-scale rooms and match summaries.
 

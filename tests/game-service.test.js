@@ -8,10 +8,9 @@ import { MemoryRoomStore } from '../server/store.js';
 
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-async function makeHarness(t) {
+async function makeHarness(t, { store = new MemoryRoomStore() } = {}) {
   const httpServer = createServer();
   const ioServer = new Server(httpServer, { cors: { origin: true } });
-  const store = new MemoryRoomStore();
   const game = new GameService({ store, io: ioServer, timeouts: { proposal: 5_000, voting: 5_000, intel: 5_000, action: 5_000, debrief: 30 } });
   ioServer.on('connection', (socket) => game.attach(socket));
   await new Promise((resolve) => httpServer.listen(0, '127.0.0.1', resolve));
@@ -47,7 +46,7 @@ async function makeHarness(t) {
     for (const socket of sockets) socket.disconnect();
     await new Promise((resolve) => ioServer.close(resolve));
   });
-  return { openPlayer, request, waitFor, states, sockets };
+  return { openPlayer, request, waitFor, states, sockets, store };
 }
 
 async function enterLobby(harness) {
@@ -254,5 +253,48 @@ test('the last player can leave and removes the empty room', async (t) => {
   const resumed = await harness.request(player, 'room:resume', room);
   assert.equal(resumed.ok, false);
   assert.match(resumed.error, /Room not found/);
+});
+
+test('a socket cannot claim seats in multiple rooms', async (t) => {
+  const harness = await makeHarness(t);
+  const player = await harness.openPlayer();
+  const firstRoom = await harness.request(player, 'room:create', { name: 'Aster' });
+  const secondPlayer = await harness.openPlayer();
+  const secondRoom = await harness.request(secondPlayer, 'room:create', { name: 'Beryl' });
+  assert.equal(firstRoom.ok, true);
+  assert.equal(secondRoom.ok, true);
+
+  const rejectedJoin = await harness.request(player, 'room:join', { code: secondRoom.code, name: 'Cinder' });
+  const rejectedCreate = await harness.request(player, 'room:create', { name: 'Dusk' });
+  assert.equal(rejectedJoin.ok, false);
+  assert.match(rejectedJoin.error, /Leave your current party/);
+  assert.equal(rejectedCreate.ok, false);
+  assert.match(rejectedCreate.error, /Leave your current party/);
+
+  assert.equal((await harness.request(player, 'room:leave')).ok, true);
+  const joinedAfterLeaving = await harness.request(player, 'room:join', { code: secondRoom.code, name: 'Cinder' });
+  assert.equal(joinedAfterLeaving.ok, true);
+  const state = await harness.waitFor(secondPlayer, (current) => current.players.length === 2, 'second room after rejoin');
+  assert.deepEqual(state.players.map((candidate) => candidate.name), ['Beryl', 'Cinder']);
+});
+
+test('a concurrent join survives the final player leaving an empty room', async (t) => {
+  const store = new MemoryRoomStore();
+  const harness = await makeHarness(t, { store });
+  const lastPlayer = await harness.openPlayer();
+  const room = await harness.request(lastPlayer, 'room:create', { name: 'Aster' });
+  const arrivingPlayer = await harness.openPlayer();
+  const deleteRoom = store.delete.bind(store);
+  let concurrentJoin;
+  store.delete = async (code, expectedRevision) => {
+    concurrentJoin = await harness.request(arrivingPlayer, 'room:join', { code, name: 'Beryl' });
+    return deleteRoom(code, expectedRevision);
+  };
+
+  assert.equal((await harness.request(lastPlayer, 'room:leave')).ok, true);
+  assert.equal(concurrentJoin.ok, true);
+  assert.equal((await harness.request(arrivingPlayer, 'player:ready', { ready: true })).ok, true);
+  const persisted = await store.get(room.code);
+  assert.deepEqual(persisted.players.map((player) => player.name), ['Beryl']);
 });
 
