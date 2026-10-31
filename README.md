@@ -4,6 +4,8 @@ MindSync is a real-time hidden-role mission game for 3–8 players. Each player 
 
 New players see a short animated cinematic before entering the room setup. **How to play?** opens a five-scene animated tutorial. Players can select an emoji avatar, chat with everyone in their room, compare room-scoped win records, and adjust sound and motion in **Options**. The five missions each have a distinct stage scene. A reticle cursor and low-volume synthesized sound cues are part of the interface; sound is optional and can be turned off.
 
+The room now includes an interactive React Three Fiber crew deck. Players appear as animated low-poly astronauts, can walk with WASD or arrow keys, drag to look around, customize suit/helmet/backpack, and send room-only **ECHO SIGNALS**. On touch layouts, a directional pad appears. Movement is validated and relayed by the existing Socket.IO server, and remote characters are interpolated on each client. Press **E** near a mission console to jump to the existing phase controls; mission actions, votes, and outcomes remain server-authoritative through the original game flow.
+
 ## Play loop
 
 1. Create a room or join one with its six-character code. Everyone marks ready.
@@ -34,10 +36,18 @@ Requirements: Node.js 20+.
 
 ```sh
 npm install
+```
+
+Start the app with in-memory rooms for local development. This overrides any `MONGODB_URI` in `.env` for the current shell, keeping the dev server away from the production database:
+
+```powershell
+$env:MONGODB_URI = ''
 npm run dev
 ```
 
-Vite serves the app at `http://localhost:5173`; the Express and Socket.IO server runs at `http://localhost:8787`. Two browser tabs use the same live server. Without `MONGODB_URI`, rooms are kept in process memory and are lost on server restart. Copy `.env.example` to `.env` to configure a local database.
+The web app runs at `http://localhost:5173`; Express and Socket.IO run at `http://localhost:8787`. Open two browser sessions in the same room to check shared customization, movement, and Echo Signals. Rooms are lost when the local server restarts. Set a local development database URI only when you intentionally want persistent local rooms.
+
+For a Unix shell, use `MONGODB_URI= npm run dev` instead. Do not copy production credentials into a local `.env`.
 
 Player records and match history are scoped to a room. There are no account-wide stats; clearing the browser's saved player key also removes that device's ability to resume its seat in an active match.
 
@@ -48,9 +58,13 @@ npm test
 npm run build
 ```
 
-## Deploy to Render
+## Deployment
 
-The live game is available at <https://mindsync-knm6.onrender.com/>. The Render web service runs in Singapore and serves the Vite build, Express API, and Socket.IO from the repository root. The included `render.yaml` keeps the service configuration in source control.
+The current all-in-one game is available at <https://mindsync-knm6.onrender.com/>. Its Render web service serves the Vite build, Express API, and Socket.IO from the repository root. The included `render.yaml` keeps the service configuration in source control.
+
+The Netlify production demo is available at <https://mindsync-handshake.netlify.app/>. Its Vite frontend connects directly to `https://mindsync-knm6.onrender.com` using Socket.IO over WebSocket; Express, room state, and MongoDB remain on Render. Netlify's static host does not run the persistent Socket.IO server. Do not put the MongoDB URI or other server secrets in Netlify's `VITE_*` variables because those values are included in browser JavaScript.
+
+Netlify uses `npm run build` and publishes `dist`. For a manual deploy, install the Netlify CLI and run `netlify deploy --prod --dir=dist` from the project root after building. The `.netlify` folder is ignored by Git because the CLI stores local site linkage there.
 
 To create another deployment from this repository:
 

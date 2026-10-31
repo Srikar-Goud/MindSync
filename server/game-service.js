@@ -1,6 +1,6 @@
 import {
   MAX_PLAYERS, MAX_REJECTIONS, MIN_PLAYERS, allReady, assignPublicId,
-  createLobby, publicState, playerToken, roomCode, safeAvatar, safeName,
+  createLobby, publicState, playerToken, roomCode, safeAppearance, safeAvatar, safeName,
   sabotageThreshold, startMatch, teamSize, tokenHash,
 } from './game.js';
 
@@ -13,6 +13,11 @@ const TIMEOUTS = Object.freeze({
 });
 const clone = (value) => structuredClone(value);
 const now = () => Date.now();
+const WORLD_SIGNALS = new Set(['follow', 'danger', 'look', 'wrong', 'stop', 'help']);
+const WORLD_MOVE_INTERVAL_MS = 80;
+const WORLD_SIGNAL_INTERVAL_MS = 1_200;
+const WORLD_SPEED = 4.2;
+const WORLD_BOUNDS = Object.freeze({ x: 10.5, z: 6.5 });
 
 export class GameService {
   constructor({ store, io, timeouts = {} }) {
@@ -25,6 +30,12 @@ export class GameService {
     this.rateLimits = new Map();
     this.chatLimits = new Map();
     this.pendingRoomActions = new Set();
+    this.roomPhases = new Map();
+    this.worldPositions = new Map();
+    this.movementTimes = new Map();
+    this.movementInputs = new Map();
+    this.signalTimes = new Map();
+    this.worldBroadcastTimers = new Map();
   }
 
   attach(socket) {
@@ -35,6 +46,8 @@ export class GameService {
       'room:leave': () => this.leaveRoom(socket),
       'player:profile': (payload) => this.setProfile(socket, payload),
       'chat:send': (payload) => this.sendChat(socket, payload),
+      'world:move': (payload) => this.movePlayer(socket, payload),
+      'world:signal': (payload) => this.sendWorldSignal(socket, payload),
       'player:ready': (payload) => this.setReady(socket, payload),
       'game:start': () => this.start(socket),
       'proposal:submit': (payload) => this.submitProposal(socket, payload),
@@ -46,7 +59,8 @@ export class GameService {
     };
     for (const [event, handler] of Object.entries(events)) {
       socket.on(event, (payload = {}, ack = () => {}) => {
-        Promise.resolve(handler(payload ?? {}))
+        Promise.resolve()
+          .then(() => handler(payload ?? {}))
           .then((data) => ack({ ok: true, ...(data ?? {}) }))
           .catch((error) => ack({ ok: false, error: error.message || 'That action could not be completed.' }));
       });
@@ -117,6 +131,7 @@ export class GameService {
         tokenHash: tokenHash(token),
         name,
         avatar: safeAvatar(payload.avatar),
+        appearance: safeAppearance(),
         role: null,
         ready: false,
         connected: true,
@@ -158,12 +173,16 @@ export class GameService {
     this.playerSockets.set(key, socket.id);
     this.socketPlayers.set(socket.id, { code, playerId });
     socket.data.gamePlayer = { code, playerId };
+    this.ensureWorldPosition(code, playerId);
+    this.broadcastWorld(code);
   }
 
   async handleDisconnect(socketId) {
     const membership = this.socketPlayers.get(socketId);
     if (!membership) return;
     this.socketPlayers.delete(socketId);
+    this.movementTimes.delete(socketId);
+    this.movementInputs.delete(socketId);
     const key = `${membership.code}:${membership.playerId}`;
     if (this.playerSockets.get(key) !== socketId) return;
     this.playerSockets.delete(key);
@@ -176,7 +195,10 @@ export class GameService {
       }
       return draft;
     });
-    if (room) this.broadcast(room);
+    if (room) {
+      this.broadcast(room);
+      this.scheduleWorldBroadcast(membership.code);
+    }
   }
 
   async leaveRoom(socket) {
@@ -212,12 +234,22 @@ export class GameService {
     const key = `${code}:${playerId}`;
     this.playerSockets.delete(key);
     this.socketPlayers.delete(socket.id);
+    this.movementTimes.delete(socket.id);
+    this.movementInputs.delete(socket.id);
+    this.signalTimes.delete(key);
+    this.worldPositions.get(code)?.delete(playerId);
     if (removeAll) {
       const deleted = await this.store.delete(code, room.revision);
       if (deleted) {
         const activeTimer = this.phaseTimers.get(code);
         if (activeTimer) clearTimeout(activeTimer.timer);
         this.phaseTimers.delete(code);
+        this.roomPhases.delete(code);
+        this.worldPositions.delete(code);
+        this.signalTimes.delete(key);
+        const pendingWorldBroadcast = this.worldBroadcastTimers.get(code);
+        if (pendingWorldBroadcast) clearTimeout(pendingWorldBroadcast);
+        this.worldBroadcastTimers.delete(code);
         for (const key of this.chatLimits.keys()) {
           if (key.startsWith(`${code}:`)) this.chatLimits.delete(key);
         }
@@ -228,22 +260,112 @@ export class GameService {
           this.broadcast(current);
         }
       }
-    } else this.broadcast(room);
+    } else {
+      this.broadcast(room);
+      this.scheduleWorldBroadcast(code);
+    }
     socket.leave(code);
     return { left: true, resetMatch };
   }
 
   async setProfile(socket, payload) {
     const { code, playerId } = this.requireMember(socket);
-    const avatar = safeAvatar(payload.avatar);
+    const key = `${code}:${playerId}`;
+    let avatar;
+    let appearance;
     const room = await this.mutate(code, (draft) => {
       const player = draft.players.find((candidate) => candidate.id === playerId);
       if (!player) throw new Error('That player seat is no longer in this room.');
-      player.avatar = avatar;
+      if (payload.avatar != null) player.avatar = safeAvatar(payload.avatar);
+      player.appearance = safeAppearance(payload.appearance, safeAppearance(player.appearance));
+      avatar = player.avatar;
+      appearance = player.appearance;
       return draft;
     });
     this.broadcast(room);
-    return { avatar };
+    return { avatar, appearance };
+  }
+
+  ensureWorldPosition(code, playerId) {
+    let positions = this.worldPositions.get(code);
+    if (!positions) {
+      positions = new Map();
+      this.worldPositions.set(code, positions);
+    }
+    if (!positions.has(playerId)) {
+      const index = positions.size;
+      const angle = (index / 8) * Math.PI * 2;
+      positions.set(playerId, { x: Math.sin(angle) * 3.2, z: Math.cos(angle) * 2.1 });
+    }
+    return positions.get(playerId);
+  }
+
+  movePlayer(socket, payload = {}) {
+    const { code, playerId } = this.requireMember(socket);
+    if (!['lobby', 'proposal', 'intel', 'action', 'debrief'].includes(this.roomPhases.get(code) || 'lobby')) {
+      return { accepted: false, reason: 'movement-paused' };
+    }
+    const x = Number(payload.x);
+    const z = Number(payload.z);
+    if (!Number.isFinite(x) || !Number.isFinite(z) || Math.abs(x) > 1.01 || Math.abs(z) > 1.01) {
+      throw new Error('Movement input is outside the allowed range.');
+    }
+    const magnitude = Math.hypot(x, z);
+    const inputX = magnitude > 1 ? x / magnitude : x;
+    const inputZ = magnitude > 1 ? z / magnitude : z;
+    const timestamp = now();
+    const previousAt = this.movementTimes.get(socket.id);
+    if (previousAt && timestamp - previousAt < WORLD_MOVE_INTERVAL_MS) return { accepted: false, reason: 'rate-limited' };
+    const delta = previousAt ? Math.min((timestamp - previousAt) / 1_000, 0.15) : 0;
+    const position = this.ensureWorldPosition(code, playerId);
+    const previousInput = this.movementInputs.get(socket.id) ?? { x: 0, z: 0 };
+    const nextX = Math.max(-WORLD_BOUNDS.x, Math.min(WORLD_BOUNDS.x, position.x + previousInput.x * WORLD_SPEED * delta));
+    const nextZ = Math.max(-WORLD_BOUNDS.z, Math.min(WORLD_BOUNDS.z, position.z + previousInput.z * WORLD_SPEED * delta));
+    const changed = Math.abs(nextX - position.x) > 0.001 || Math.abs(nextZ - position.z) > 0.001;
+    position.x = nextX;
+    position.z = nextZ;
+    this.movementTimes.set(socket.id, timestamp);
+    this.movementInputs.set(socket.id, { x: inputX, z: inputZ });
+    if (changed) this.scheduleWorldBroadcast(code);
+    return { accepted: true, position: { ...position } };
+  }
+
+  sendWorldSignal(socket, payload = {}) {
+    const { code, playerId } = this.requireMember(socket);
+    const type = String(payload.type ?? '');
+    if (!WORLD_SIGNALS.has(type)) throw new Error('Choose an available Echo Signal.');
+    const key = `${code}:${playerId}`;
+    const timestamp = now();
+    const previousAt = this.signalTimes.get(key) ?? 0;
+    if (timestamp - previousAt < WORLD_SIGNAL_INTERVAL_MS) throw new Error('Wait a moment before sending another signal.');
+    this.signalTimes.set(key, timestamp);
+    if (this.roomPhases.get(code) === 'finished') throw new Error('Echo Signals close when the operation ends.');
+    const signal = { id: assignPublicId(), roomCode: code, type, playerId, createdAt: timestamp };
+    for (const [seatKey, socketId] of this.playerSockets) {
+      if (!seatKey.startsWith(`${code}:`)) continue;
+      this.io.sockets.sockets.get(socketId)?.emit('world:signal', signal);
+    }
+    return { sent: true };
+  }
+
+  scheduleWorldBroadcast(code) {
+    if (this.worldBroadcastTimers.has(code)) return;
+    const timer = setTimeout(() => {
+      this.worldBroadcastTimers.delete(code);
+      this.broadcastWorld(code);
+    }, 50);
+    timer.unref?.();
+    this.worldBroadcastTimers.set(code, timer);
+  }
+
+  broadcastWorld(code) {
+    const positions = this.worldPositions.get(code);
+    if (!positions) return;
+    const snapshot = { roomCode: code, positions: Object.fromEntries([...positions].map(([id, position]) => [id, { ...position }])) };
+    for (const [seatKey, socketId] of this.playerSockets) {
+      if (!seatKey.startsWith(`${code}:`)) continue;
+      this.io.sockets.sockets.get(socketId)?.emit('world:state', snapshot);
+    }
   }
 
   async sendChat(socket, payload) {
@@ -601,6 +723,7 @@ export class GameService {
   }
 
   broadcast(room) {
+    this.roomPhases.set(room.code, room.phase);
     for (const player of room.players) {
       const socketId = this.playerSockets.get(`${room.code}:${player.id}`);
       if (!socketId) continue;

@@ -3,6 +3,8 @@ import { createRoot } from 'react-dom/client';
 import { io } from 'socket.io-client';
 import './styles.css';
 
+const SpatialDeck = React.lazy(() => import('./scene/SpatialDeck.jsx'));
+
 const SESSION_KEY = 'mindsync-player-session-v1';
 const INTRO_KEY = 'mindsync-intro-seen-v2';
 const AVATAR_KEY = 'mindsync-avatar-v1';
@@ -119,14 +121,20 @@ function useDialogFocus(onClose) {
 }
 
 function App() {
-  const socket = useMemo(() => io({
-    autoConnect: false,
-    reconnection: true,
-    reconnectionAttempts: Infinity,
-    reconnectionDelay: 600,
-    reconnectionDelayMax: 4500,
-    timeout: 12_000,
-  }), []);
+  const socket = useMemo(() => {
+    const options = {
+      autoConnect: false,
+      reconnection: true,
+      reconnectionAttempts: Infinity,
+      reconnectionDelay: 600,
+      reconnectionDelayMax: 4500,
+      timeout: 12_000,
+    };
+    const serverUrl = import.meta.env.VITE_SOCKET_URL;
+    return serverUrl
+      ? io(serverUrl, { ...options, transports: ['websocket'] })
+      : io(options);
+  }, []);
   const [session, setSession] = useState(readSavedSession);
   const [state, setState] = useState(null);
   const [online, setOnline] = useState(false);
@@ -142,6 +150,7 @@ function App() {
   const [tutorialOpen, setTutorialOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [profileOpen, setProfileOpen] = useState(false);
+  const [appearancePreview, setAppearancePreview] = useState(null);
   const [soundOn, setSoundOn] = useState(() => readBool(SOUND_KEY, true));
   const [reducedMotion, setReducedMotion] = useState(() => readBool(MOTION_KEY, window.matchMedia?.('(prefers-reduced-motion: reduce)').matches ?? false));
   const previousPhase = useRef(null);
@@ -231,6 +240,10 @@ function App() {
     if (state?.phase === 'proposal') setTeam([]);
   }, [state?.phase, state?.mission?.number, state?.leaderId]);
 
+  useEffect(() => {
+    if (state?.you?.appearance) setAppearancePreview(state.you.appearance);
+  }, [state?.you?.appearance]);
+
   const send = (event, payload = {}) => emitWithAck(socket, event, payload);
 
   const saveSession = (result) => {
@@ -311,6 +324,11 @@ function App() {
     } catch { setNotice(`Share code ${state.code} with your team`); }
   };
 
+  const focusSpatialControls = () => {
+    const selector = state?.phase === 'lobby' ? '.lobby-actions' : '.game-layout .phase-card, .final-hero';
+    document.querySelector(selector)?.scrollIntoView({ behavior: reducedMotion ? 'auto' : 'smooth', block: 'center' });
+  };
+
   const content = !state ? <Landing
       name={name} setName={setName} code={code} setCode={setCode}
       online={online} busy={busy} error={error} setError={setError}
@@ -336,6 +354,22 @@ function App() {
       <button className="share-button" onClick={copyCode}><span>↗</span> Share code</button>
       <div className="room-strip-right"><span className="live-indicator" />{phaseLabel[state.phase] || state.phase}</div>
     </div>
+
+    <React.Suspense fallback={<div className="spatial-loading" role="status">Preparing the crew deck…</div>}>
+      <SpatialDeck
+        roomCode={state.code}
+        phase={state.phase}
+        players={state.players}
+        you={state.you}
+        socket={socket}
+        online={online}
+        stageNumber={state.mission?.number || 1}
+        appearance={appearancePreview || state.you?.appearance}
+        onAppearanceChange={setAppearancePreview}
+        onInteract={focusSpatialControls}
+        suspended={tutorialOpen || settingsOpen || profileOpen}
+      />
+    </React.Suspense>
 
     {notice && <div className="toast" role="status">{notice}</div>}
     {error && <div className="error-banner" role="alert">{error}</div>}

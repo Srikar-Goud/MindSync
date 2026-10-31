@@ -12,13 +12,15 @@
     "test": "node --test"
   },
   "dependencies": {
+    "@react-three/fiber": "8.18.0",
     "dotenv": "^16.6.1",
     "express": "^5.1.0",
     "mongodb": "^6.20.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "socket.io": "^4.8.1",
-    "socket.io-client": "^4.8.1"
+    "socket.io-client": "^4.8.1",
+    "three": "0.186.1"
   },
   "devDependencies": {
     "@vitejs/plugin-react": "^4.3.4",

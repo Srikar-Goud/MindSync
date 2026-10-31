@@ -4,6 +4,10 @@ export const MIN_PLAYERS = 3;
 export const MAX_PLAYERS = 8;
 export const MAX_REJECTIONS = 5;
 export const PLAYER_AVATARS = Object.freeze(['🛰️', '🦊', '🐺', '🐼', '🦉', '🐙', '🦋', '🐸', '🐯', '🦄', '👾', '🤖', '🎭', '🧿', '🔥', '🌙']);
+export const DEFAULT_APPEARANCE = Object.freeze({ suit: 'violet', helmet: 'aegis', pack: 'standard' });
+const SUIT_STYLES = new Set(['violet', 'cyan', 'ember', 'mint', 'gold', 'rose']);
+const HELMET_STYLES = new Set(['aegis', 'pilot', 'halo']);
+const PACK_STYLES = new Set(['standard', 'twin', 'wing']);
 export const ROLE_COUNTS = Object.freeze({ 3: 1, 4: 1, 5: 1, 6: 2, 7: 2, 8: 2 });
 export const TEAM_SIZES = Object.freeze({
   3: [2, 2, 2, 2, 2],
@@ -22,6 +26,13 @@ export const playerToken = () => randomBytes(TOKEN_BYTES).toString('base64url');
 export const tokenHash = (token) => createHash('sha256').update(token).digest('hex');
 export const safeName = (value) => String(value ?? '').replace(/[\u0000-\u001f\u007f]/g, '').trim().replace(/\s+/g, ' ').slice(0, 18);
 export const safeAvatar = (value) => PLAYER_AVATARS.includes(value) ? value : PLAYER_AVATARS[0];
+export function safeAppearance(value = {}, fallback = DEFAULT_APPEARANCE) {
+  return {
+    suit: SUIT_STYLES.has(value?.suit) ? value.suit : fallback.suit,
+    helmet: HELMET_STYLES.has(value?.helmet) ? value.helmet : fallback.helmet,
+    pack: PACK_STYLES.has(value?.pack) ? value.pack : fallback.pack,
+  };
+}
 
 export function roleCounts(playerCount) {
   return ROLE_COUNTS[playerCount] ?? 0;
@@ -50,6 +61,7 @@ export function createLobby({ code, playerId, token, name, avatar, now = Date.no
       tokenHash: tokenHash(token),
       name: safeName(name),
       avatar: safeAvatar(avatar),
+      appearance: { ...DEFAULT_APPEARANCE },
       role: null,
       ready: false,
       connected: true,
@@ -128,8 +140,8 @@ export function allReady(room) {
 export function publicState(room, playerId) {
   const finished = room.phase === 'finished';
   const player = room.players.find((candidate) => candidate.id === playerId);
-  const publicPlayers = room.players.map(({ id, name, avatar, ready, connected, wins, matchesPlayed, rematchReady, role }) => ({
-    id, name, avatar: safeAvatar(avatar), ready, connected, wins, matchesPlayed, rematchReady,
+  const publicPlayers = room.players.map(({ id, name, avatar, appearance, ready, connected, wins, matchesPlayed, rematchReady, role }) => ({
+    id, name, avatar: safeAvatar(avatar), appearance: safeAppearance(appearance), ready, connected, wins, matchesPlayed, rematchReady,
     ...(finished ? { role } : {}),
   }));
   const proposals = room.proposalLog.map((item) => ({
@@ -156,6 +168,7 @@ export function publicState(room, playerId) {
     you: player ? {
       id: player.id,
       avatar: safeAvatar(player.avatar),
+      appearance: safeAppearance(player.appearance),
       role: finished ? player.role : player.role,
       isHost: player.id === room.hostId,
       ready: player.ready,

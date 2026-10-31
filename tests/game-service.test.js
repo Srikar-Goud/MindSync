@@ -8,6 +8,16 @@ import { MemoryRoomStore } from '../server/store.js';
 
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+async function waitForEventValue(values, socket, predicate, label) {
+  const end = Date.now() + 2_500;
+  while (Date.now() < end) {
+    const current = values.get(socket);
+    if (current && predicate(current)) return current;
+    await wait(5);
+  }
+  throw new Error(`Timed out waiting for ${label}. Current value: ${JSON.stringify(values.get(socket))}`);
+}
+
 async function makeHarness(t, { store = new MemoryRoomStore() } = {}) {
   const httpServer = createServer();
   const ioServer = new Server(httpServer, { cors: { origin: true } });
@@ -17,9 +27,13 @@ async function makeHarness(t, { store = new MemoryRoomStore() } = {}) {
   const address = httpServer.address();
   const sockets = [];
   const states = new Map();
+  const worldStates = new Map();
+  const worldSignals = new Map();
   const openPlayer = async () => {
     const socket = connectSocket(`http://127.0.0.1:${address.port}`, { transports: ['websocket'], reconnection: false, forceNew: true });
     socket.on('room:state', (state) => states.set(socket, state));
+    socket.on('world:state', (state) => worldStates.set(socket, state));
+    socket.on('world:signal', (signal) => worldSignals.set(socket, signal));
     sockets.push(socket);
     await new Promise((resolve, reject) => {
       socket.once('connect', resolve);
@@ -46,7 +60,7 @@ async function makeHarness(t, { store = new MemoryRoomStore() } = {}) {
     for (const socket of sockets) socket.disconnect();
     await new Promise((resolve) => ioServer.close(resolve));
   });
-  return { openPlayer, request, waitFor, states, sockets, store };
+  return { openPlayer, request, waitFor, waitForEventValue, states, worldStates, worldSignals, sockets, store };
 }
 
 async function enterLobby(harness) {
@@ -222,8 +236,15 @@ test('room chat is synchronized and avatar updates are room-wide without exposin
   assert.equal(firstState.chat[0].message, 'Ready for the first mission 👀');
   assert.equal(firstState.players.some((player) => 'role' in player), false, 'room chat does not reveal private roles');
   assert.equal((await request(outsider, 'chat:send', { message: 'intrude' })).ok, false, 'chat is limited to room members');
-  assert.equal((await request(room.players[1], 'player:profile', { avatar: '🦊' })).ok, true);
-  for (const socket of room.players) await waitFor(socket, (state) => state.players.find((player) => player.id === room.ids[1])?.avatar === '🦊', 'room-wide avatar update');
+  assert.equal((await request(room.players[1], 'player:profile', {
+    avatar: '🦊',
+    appearance: { suit: 'ember', helmet: 'pilot', pack: 'wing', role: 'saboteur' },
+  })).ok, true);
+  for (const socket of room.players) await waitFor(socket, (state) => {
+    const updated = state.players.find((player) => player.id === room.ids[1]);
+    return updated?.avatar === '🦊' && updated.appearance?.suit === 'ember' && updated.appearance?.helmet === 'pilot' && updated.appearance?.pack === 'wing';
+  }, 'room-wide avatar customization');
+  assert.equal(states.get(room.host).players.some((player) => 'role' in player), false, 'appearance updates do not expose roles');
 });
 
 test('a player can leave during an operation and remaining players return to a safe lobby', async (t) => {
@@ -296,5 +317,62 @@ test('a concurrent join survives the final player leaving an empty room', async 
   assert.equal((await harness.request(arrivingPlayer, 'player:ready', { ready: true })).ok, true);
   const persisted = await store.get(room.code);
   assert.deepEqual(persisted.players.map((player) => player.name), ['Beryl']);
+});
+
+test('world movement is room-authorized, rate-limited, bounded, and synchronized', async (t) => {
+  const harness = await makeHarness(t);
+  const room = await enterLobby(harness);
+  const unbound = await harness.openPlayer();
+  const denied = await harness.request(unbound, 'world:move', { x: 1, z: 0 });
+  assert.equal(denied.ok, false, 'a socket outside the room has no movement authority');
+
+  const hostId = harness.states.get(room.host).you.id;
+  const otherMember = room.players[1];
+  const initial = await harness.waitForEventValue(harness.worldStates, otherMember, (snapshot) => Number.isFinite(snapshot.positions?.[hostId]?.x), 'initial deck positions');
+  const startX = initial.positions[hostId].x;
+  const realDateNow = Date.now;
+  let testTime = realDateNow();
+  Date.now = () => testTime;
+  try {
+    assert.equal((await harness.request(room.host, 'world:move', { x: 1, z: 0 })).accepted, true);
+    testTime += 100;
+    const moved = await harness.request(room.host, 'world:move', { x: 1, z: 0 });
+    assert.equal(moved.accepted, true);
+    assert.ok(moved.position.x > startX, 'the server advances the accepted room position');
+    const snapshot = await harness.waitForEventValue(harness.worldStates, otherMember, (value) => value.positions?.[hostId]?.x > startX, 'remote movement snapshot');
+    assert.ok(snapshot.positions[hostId].x > startX, 'other players receive the authoritative position');
+
+    const tooFast = await harness.request(room.host, 'world:move', { x: 0, z: 1 });
+    assert.equal(tooFast.accepted, false);
+    assert.equal(tooFast.reason, 'rate-limited');
+    const invalid = await harness.request(room.host, 'world:move', { x: 20, z: 0 });
+    assert.equal(invalid.ok, false, 'out-of-range input is rejected');
+  } finally {
+    Date.now = realDateNow;
+  }
+});
+
+test('Echo Signals are validated, rate-limited, and broadcast only to room members', async (t) => {
+  const harness = await makeHarness(t);
+  const room = await enterLobby(harness);
+  const outsider = await harness.openPlayer();
+  assert.equal((await harness.request(outsider, 'room:create', { name: 'Dusk' })).ok, true);
+
+  const sent = await harness.request(room.host, 'world:signal', { type: 'danger' });
+  assert.equal(sent.ok, true);
+  assert.equal(sent.sent, true);
+  const signal = await harness.waitForEventValue(harness.worldSignals, room.players[1], (value) => value.type === 'danger', 'room Echo Signal');
+  assert.equal(signal.roomCode, room.code);
+  assert.equal(signal.playerId, harness.states.get(room.host).you.id);
+  await wait(60);
+  assert.equal(harness.worldSignals.has(outsider), false, 'signals do not escape the room');
+
+  const tooFast = await harness.request(room.host, 'world:signal', { type: 'help' });
+  assert.equal(tooFast.ok, false, 'signal cooldown is enforced by the server');
+  const invalid = await harness.request(room.players[1], 'world:signal', { type: 'reveal-role' });
+  assert.equal(invalid.ok, false, 'unknown signal types are rejected');
+  const unboundSocket = await harness.openPlayer();
+  const unbound = await harness.request(unboundSocket, 'world:signal', { type: 'look' });
+  assert.equal(unbound.ok, false, 'an unbound socket cannot signal into a room');
 });
 
